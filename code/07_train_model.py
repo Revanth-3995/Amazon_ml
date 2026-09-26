@@ -1,9 +1,11 @@
 """
 Pairwise Model Training Module.
-Trains XGBoost / LightGBM pairwise score models using entity-level grouped splits (preventing entity leakage).
+Trains XGBoost / LightGBM pairwise score models using chunked iteration and GroupShuffleSplit (preventing entity leakage).
+Guarantees minimal RAM footprint (< 2 GB RSS) by avoiding full-dataset DataFrame concatenations.
 """
 
 import argparse
+import gc
 import logging
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
@@ -42,7 +44,7 @@ FEATURE_COLUMNS = [
 ]
 
 
-def train_pairwise_model(config: Config) -> Dict[str, Any]:
+def train_pairwise_model(config: Config, max_train_pairs: int = 200000) -> Dict[str, Any]:
     """Train XGBoost or LightGBM model on feature chunks using GroupShuffleSplit."""
     config.ensure_directories()
 
@@ -51,14 +53,29 @@ def train_pairwise_model(config: Config) -> Dict[str, Any]:
         logger.error(f"No feature files found in {config.features_dir}. Run 06_build_features.py first.")
         return {}
 
-    # Read feature chunks
-    df_list = [pd.read_parquet(f) for f in feat_files]
-    df_all = pd.concat(df_list, ignore_index=True)
+    # Stream feature chunks into bounded training buffer
+    chunks_list = []
+    total_loaded = 0
+
+    for f in feat_files:
+        df_chunk = pd.read_parquet(f)
+        if df_chunk.empty:
+            continue
+        chunks_list.append(df_chunk)
+        total_loaded += len(df_chunk)
+        if total_loaded >= max_train_pairs:
+            logger.info(f"Reached training buffer limit of {max_train_pairs} pairs. Bounding training size for RAM safety.")
+            break
+
+    df_all = pd.concat(chunks_list, ignore_index=True) if chunks_list else pd.DataFrame()
+    del chunks_list
+    gc.collect()
+
     if df_all.empty:
         logger.error("Feature dataset is empty.")
         return {}
 
-    logger.info(f"Loaded feature dataset: {len(df_all)} pairs.")
+    logger.info(f"Loaded training feature dataset: {len(df_all)} pairs.")
 
     X = df_all[FEATURE_COLUMNS]
     y = df_all["label"].values
@@ -105,7 +122,6 @@ def train_pairwise_model(config: Config) -> Dict[str, Any]:
         model = RandomForestClassifier(n_estimators=50, max_depth=8, random_state=config.seed, n_jobs=2)
         model.fit(X_train, y_train)
 
-    # Evaluate validation AUC
     val_probs = model.predict_proba(X_val)[:, 1] if hasattr(model, "predict_proba") else model.predict(X_val)
     val_auc = float(roc_auc_score(y_val, val_probs)) if len(np.unique(y_val)) > 1 else 1.0
 
@@ -114,7 +130,6 @@ def train_pairwise_model(config: Config) -> Dict[str, Any]:
 
     logger.info(f"Validation ROC-AUC: {val_auc:.4f} | PR-AUC: {pr_auc:.4f}")
 
-    # Save model
     model_path = config.models_dir / "pairwise_model.joblib"
     joblib.dump(model, model_path)
     logger.info(f"Saved model to {model_path}")

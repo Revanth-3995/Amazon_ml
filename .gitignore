@@ -3,3 +3,15 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 *.tmp
+
+# Data and pipeline artifacts
+dataset/
+processed/
+indexes/
+candidates/
+features/
+models/
+predictions/
+evaluation/
+logs/
+work/

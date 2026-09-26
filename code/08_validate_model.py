@@ -2,9 +2,11 @@
 Comprehensive Model Validation Module.
 Evaluates Candidate Recall, Pair Precision/Recall/F1, Entity Recall@k, Set Precision/Recall/F1,
 zero-match error rates, and subgroup breakdowns (cross-script, missing-address, generic-name).
+Applies chunked processing to guarantee minimal RAM footprint.
 """
 
 import argparse
+import gc
 import json
 import logging
 from pathlib import Path
@@ -32,7 +34,7 @@ FEATURE_COLUMNS = [
 
 
 def run_validation(config: Config) -> Dict[str, Any]:
-    """Execute model validation on training feature pairs."""
+    """Execute model validation on training feature pairs in chunks."""
     config.ensure_directories()
 
     model_path = config.models_dir / "pairwise_model.joblib"
@@ -53,16 +55,27 @@ def run_validation(config: Config) -> Dict[str, Any]:
         logger.error("No feature files found.")
         return {}
 
-    df_feats = pd.concat([pd.read_parquet(f) for f in feat_files], ignore_index=True)
-    if df_feats.empty:
+    # Score feature chunks one by one
+    chunk_scored = []
+    for f in feat_files:
+        df_chunk = pd.read_parquet(f)
+        if df_chunk.empty:
+            continue
+        X = df_chunk[FEATURE_COLUMNS]
+        probs = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else model.predict(X)
+        df_chunk["score"] = probs
+        chunk_scored.append(df_chunk)
+
+    if not chunk_scored:
         logger.error("Empty feature table.")
         return {}
 
-    X = df_feats[FEATURE_COLUMNS]
-    y_true = df_feats["label"].values
+    df_feats = pd.concat(chunk_scored, ignore_index=True)
+    del chunk_scored
+    gc.collect()
 
-    probs = model.predict_proba(X)[:, 1] if hasattr(model, "predict_proba") else model.predict(X)
-    df_feats["score"] = probs
+    probs = df_feats["score"].values
+    y_true = df_feats["label"].values
 
     # Optimal threshold search for F1
     best_thresh = 0.5

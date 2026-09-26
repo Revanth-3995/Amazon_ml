@@ -44,10 +44,13 @@ def test_pairs_and_features_pipeline():
         # Step 4A: Build Training Pairs
         build_training_pairs(cfg, resume=False)
 
-        pair_files = list(cfg.processed_dir.glob("training_pairs_*.parquet"))
+        pair_files = sorted(list(cfg.processed_dir.glob("training_pairs_*.parquet")))
         assert len(pair_files) > 0, "No training pair parquet files generated"
 
-        df_pairs = pd.read_parquet(pair_files[0])
+        non_empty_pairs = [pd.read_parquet(f) for f in pair_files if not pd.read_parquet(f).empty]
+        assert len(non_empty_pairs) > 0, "All training pair files were empty"
+        df_pairs = pd.concat(non_empty_pairs, ignore_index=True)
+
         assert "s1_entity_id" in df_pairs.columns
         assert "target_entity_id" in df_pairs.columns
         assert "label" in df_pairs.columns
@@ -59,10 +62,13 @@ def test_pairs_and_features_pipeline():
         # Step 4B: Build Features
         build_features(cfg, is_test=False, resume=False)
 
-        feat_files = list(cfg.features_dir.glob("features_*.parquet"))
+        feat_files = sorted(list(cfg.features_dir.glob("features_training_pairs_*.parquet")))
         assert len(feat_files) > 0, "No feature parquet files generated"
 
-        df_feats = pd.read_parquet(feat_files[0])
+        non_empty_feats = [pd.read_parquet(f) for f in feat_files if not pd.read_parquet(f).empty]
+        assert len(non_empty_feats) > 0, "All feature files were empty"
+        df_feats = pd.concat(non_empty_feats, ignore_index=True)
+
         expected_cols = [
             "name_exact", "core_name_exact", "name_similarity", "core_name_similarity",
             "name_token_jaccard", "name_token_overlap", "address_exact", "address_similarity",
@@ -74,6 +80,5 @@ def test_pairs_and_features_pipeline():
         for col in expected_cols:
             assert col in df_feats.columns, f"Missing feature column: {col}"
 
-        # Verify optimized compact dtypes
         assert df_feats["name_similarity"].dtype == "float32"
         assert df_feats["name_exact"].dtype == "int8"

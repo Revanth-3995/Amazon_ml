@@ -2,6 +2,7 @@
 Disk-backed Inverted Index Builder using DuckDB.
 Builds token frequency statistics and inverted indexes (exact name, core name, rare tokens, numeric tokens, country)
 separately for train and test target sources without loading complete dataset DataFrames into RAM.
+Enforces candidate block capping (max_candidates_per_block) to protect memory.
 """
 
 import argparse
@@ -79,8 +80,8 @@ def build_indexes(config: Config, resume: bool = True) -> None:
     logger.info(f"Built token frequency table at {token_freq_path}")
 
     total_docs = conn.execute("SELECT COUNT(*) FROM processed_data").fetchone()[0]
-    rare_threshold = max(2, int(total_docs * config.max_token_freq_ratio))
-    logger.info(f"Total documents: {total_docs}. Rare token max threshold: {rare_threshold}")
+    rare_threshold = min(max(2, int(total_docs * config.max_token_freq_ratio)), config.max_candidates_per_block)
+    logger.info(f"Total documents: {total_docs}. Rare token max threshold (capped at max_candidates_per_block): {rare_threshold}")
 
     conn.execute(f"""
         CREATE VIEW rare_tokens AS

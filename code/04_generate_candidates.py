@@ -1,13 +1,12 @@
 """
 Adaptive Multi-View Candidate Generation Module.
-Constructs evidence profiles per Source1 entity, dynamically selects blocking views, handles candidate limits
-and overflow fallback mechanisms, records evidence tags, and streams candidate chunks to disk safely.
+Uses set-based vectorized DuckDB SQL joins over S1 chunk Parquet files against disk-backed indexes
+for fast execution on Google Drive without row-by-row point query bottlenecks.
 """
 
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
 
 import duckdb
 import pandas as pd
@@ -20,74 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("04_generate_candidates")
 
 
-class EvidenceProfile:
-    """Holds profile information for a Source 1 record."""
-
-    def __init__(self, record: Dict[str, Any], rare_tokens_set: Set[str]):
-        self.internal_id = record["internal_id"]
-        self.entity_id = record["entity_id"]
-        self.normalized_name = record["normalized_name"]
-        self.core_name = record["core_name"]
-        self.normalized_address = record.get("normalized_address", "")
-        self.country = record.get("country", "")
-        self.name_script = record.get("name_script", "Latin")
-        self.translit_name = record.get("translit_name", self.normalized_name)
-
-        self.name_tokens = record.get("name_tokens", "").split() if record.get("name_tokens") else []
-        self.address_tokens = record.get("address_tokens", "").split() if record.get("address_tokens") else []
-        self.numeric_tokens = record.get("numeric_tokens", "").split() if record.get("numeric_tokens") else []
-
-        self.has_name = bool(self.normalized_name)
-        self.has_address = bool(self.normalized_address)
-        self.has_country = bool(self.country)
-        self.has_numeric = bool(self.numeric_tokens)
-
-        # Identify rare tokens
-        self.rare_name_tokens = [t for t in self.name_tokens if t in rare_tokens_set]
-        self.rare_address_tokens = [t for t in self.address_tokens if t in rare_tokens_set]
-
-        # Generic name score: if name has no rare tokens and name_tokens length <= 2
-        self.is_generic_name = (len(self.rare_name_tokens) == 0 and len(self.name_tokens) <= 2)
-        self.cross_script_possible = (self.name_script != "Latin")
-
-
-class BlockingPolicy:
-    """Selects dynamic blocking views based on EvidenceProfile and handles overflow rules."""
-
-    def __init__(self, max_candidates_per_entity: int = 500):
-        self.max_candidates_per_entity = max_candidates_per_entity
-
-    def select_views(self, profile: EvidenceProfile) -> List[str]:
-        """Select active blocking views for this profile."""
-        views = []
-
-        if profile.has_name:
-            views.append("exact_name")
-            if profile.core_name:
-                views.append("core_name")
-
-        # Use rare name tokens if not overly generic
-        if profile.rare_name_tokens and not profile.is_generic_name:
-            views.append("rare_name_token")
-
-        if profile.rare_address_tokens:
-            views.append("rare_address_token")
-
-        if profile.has_numeric:
-            views.append("numeric_token")
-
-        if profile.cross_script_possible and profile.translit_name:
-            views.append("translit_name")
-
-        # Fallback if no specific token views selected
-        if not views and profile.has_country:
-            views.append("country")
-
-        return views
-
-
 def generate_candidates(config: Config, resume: bool = True) -> None:
-    """Generate candidates for all S1 entities in chunks using DuckDB disk indexes."""
+    """Generate candidates for train S1 entities using set-based vectorized DuckDB joins."""
     config.ensure_directories()
     manifest = ManifestManager(config.candidates_dir / "manifest.json")
 
@@ -97,28 +30,21 @@ def generate_candidates(config: Config, resume: bool = True) -> None:
     idx_dir = config.indexes_dir
     proc_dir = config.processed_dir
 
-    # Load rare tokens into set for profiler
     freq_path = idx_dir / "token_frequencies.parquet"
     if not freq_path.exists():
         logger.error(f"Token frequency table {freq_path} not found. Run 02_build_indexes.py first.")
         return
 
-    # High document frequency tokens are not rare
-    df_freq = pd.read_parquet(freq_path)
-    rare_tokens_set = set(df_freq[df_freq["doc_freq"] <= 50]["token"].tolist())
+    # Create DuckDB index views filtered strictly for train target sources
+    target_filter = "WHERE source_name IN ('train_source2', 'train_source3')"
+    conn.execute(f"CREATE VIEW idx_exact AS SELECT * FROM read_parquet('{idx_dir / 'exact_name_index.parquet'}') {target_filter}")
+    conn.execute(f"CREATE VIEW idx_core AS SELECT * FROM read_parquet('{idx_dir / 'core_name_index.parquet'}') {target_filter}")
+    conn.execute(f"CREATE VIEW idx_rare_name AS SELECT * FROM read_parquet('{idx_dir / 'rare_name_token_index.parquet'}') {target_filter}")
+    conn.execute(f"CREATE VIEW idx_rare_addr AS SELECT * FROM read_parquet('{idx_dir / 'rare_address_token_index.parquet'}') {target_filter}")
+    conn.execute(f"CREATE VIEW idx_numeric AS SELECT * FROM read_parquet('{idx_dir / 'numeric_token_index.parquet'}') {target_filter}")
+    conn.execute(f"CREATE VIEW idx_translit AS SELECT * FROM read_parquet('{idx_dir / 'translit_name_index.parquet'}') {target_filter}")
 
-    # Create DuckDB index views
-    conn.execute(f"CREATE VIEW idx_exact AS SELECT * FROM read_parquet('{idx_dir / 'exact_name_index.parquet'}')")
-    conn.execute(f"CREATE VIEW idx_core AS SELECT * FROM read_parquet('{idx_dir / 'core_name_index.parquet'}')")
-    conn.execute(f"CREATE VIEW idx_rare_name AS SELECT * FROM read_parquet('{idx_dir / 'rare_name_token_index.parquet'}')")
-    conn.execute(f"CREATE VIEW idx_rare_addr AS SELECT * FROM read_parquet('{idx_dir / 'rare_address_token_index.parquet'}')")
-    conn.execute(f"CREATE VIEW idx_numeric AS SELECT * FROM read_parquet('{idx_dir / 'numeric_token_index.parquet'}')")
-    conn.execute(f"CREATE VIEW idx_translit AS SELECT * FROM read_parquet('{idx_dir / 'translit_name_index.parquet'}')")
-
-    policy = BlockingPolicy(max_candidates_per_entity=config.max_candidates_per_entity)
-
-    # Process all S1 chunks
-    s1_files = sorted(list(proc_dir.glob("*source1_chunk_*.parquet")))
+    s1_files = sorted(list(proc_dir.glob("train_source1_chunk_*.parquet")))
     s1_files = [f for f in s1_files if not f.name.startswith("id_map_")]
 
     stage_name = "generate_candidates"
@@ -132,121 +58,94 @@ def generate_candidates(config: Config, resume: bool = True) -> None:
             logger.info(f"Skipping completed candidates chunk {chunk_id}")
             continue
 
-        logger.info(f"Generating candidates for S1 chunk: {chunk_file.name}")
-        df_s1 = pd.read_parquet(chunk_file)
+        logger.info(f"Vectorized candidate generation for S1 chunk: {chunk_file.name}")
 
-        all_candidate_rows = []
+        conn.execute(f"CREATE VIEW s1_chunk AS SELECT * FROM read_parquet('{str(chunk_file)}')")
 
-        for _, row in df_s1.iterrows():
-            profile = EvidenceProfile(row.to_dict(), rare_tokens_set)
-            views = policy.select_views(profile)
+        # Execute vectorized multi-view blocking join query directly in DuckDB
+        conn.execute(f"""
+            CREATE TEMP TABLE raw_cands AS
+            -- Exact Name View
+            SELECT s1.internal_id AS s1_internal_id, s1.entity_id AS s1_entity_id,
+                   t.internal_id AS target_internal_id, t.entity_id AS target_entity_id,
+                   'exact_name' AS blocking_view
+            FROM s1_chunk s1 JOIN idx_exact t ON s1.normalized_name = t.normalized_name AND s1.internal_id != t.internal_id
+            WHERE s1.normalized_name != ''
 
-            candidates_map: Dict[Tuple[int, str], List[str]] = {}
+            UNION ALL
 
-            # Execute queries for each selected view
-            if "exact_name" in views and profile.normalized_name:
-                exact_matches = conn.execute(
-                    "SELECT internal_id, entity_id FROM idx_exact WHERE normalized_name = ?",
-                    [profile.normalized_name]
-                ).fetchall()
-                for target_int_id, target_ent_id in exact_matches:
-                    if target_int_id != profile.internal_id:
-                        key = (target_int_id, target_ent_id)
-                        candidates_map.setdefault(key, []).append("exact_name")
+            -- Core Name View
+            SELECT s1.internal_id, s1.entity_id, t.internal_id, t.entity_id, 'core_name'
+            FROM s1_chunk s1 JOIN idx_core t ON s1.core_name = t.core_name AND s1.internal_id != t.internal_id
+            WHERE s1.core_name != ''
 
-            if "core_name" in views and profile.core_name:
-                core_matches = conn.execute(
-                    "SELECT internal_id, entity_id FROM idx_core WHERE core_name = ?",
-                    [profile.core_name]
-                ).fetchall()
-                for target_int_id, target_ent_id in core_matches:
-                    if target_int_id != profile.internal_id:
-                        key = (target_int_id, target_ent_id)
-                        candidates_map.setdefault(key, []).append("core_name")
+            UNION ALL
 
-            if "rare_name_token" in views and profile.rare_name_tokens:
-                for tok in profile.rare_name_tokens:
-                    tok_matches = conn.execute(
-                        "SELECT internal_id, entity_id FROM idx_rare_name WHERE token = ?",
-                        [tok]
-                    ).fetchall()
-                    for target_int_id, target_ent_id in tok_matches:
-                        if target_int_id != profile.internal_id:
-                            key = (target_int_id, target_ent_id)
-                            candidates_map.setdefault(key, []).append("rare_name_token")
+            -- Rare Name Token View
+            SELECT s1.internal_id, s1.entity_id, t.internal_id, t.entity_id, 'rare_name_token'
+            FROM (
+                SELECT internal_id, entity_id, unnest(string_split(name_tokens, ' ')) AS token
+                FROM s1_chunk WHERE name_tokens != ''
+            ) s1 JOIN idx_rare_name t ON s1.token = t.token AND s1.internal_id != t.internal_id
 
-            if "rare_address_token" in views and profile.rare_address_tokens:
-                for tok in profile.rare_address_tokens:
-                    tok_matches = conn.execute(
-                        "SELECT internal_id, entity_id FROM idx_rare_addr WHERE token = ?",
-                        [tok]
-                    ).fetchall()
-                    for target_int_id, target_ent_id in tok_matches:
-                        if target_int_id != profile.internal_id:
-                            key = (target_int_id, target_ent_id)
-                            candidates_map.setdefault(key, []).append("rare_address_token")
+            UNION ALL
 
-            if "numeric_token" in views and profile.numeric_tokens:
-                for num_tok in profile.numeric_tokens:
-                    num_matches = conn.execute(
-                        "SELECT internal_id, entity_id FROM idx_numeric WHERE numeric_token = ?",
-                        [num_tok]
-                    ).fetchall()
-                    for target_int_id, target_ent_id in num_matches:
-                        if target_int_id != profile.internal_id:
-                            key = (target_int_id, target_ent_id)
-                            candidates_map.setdefault(key, []).append("numeric_token")
+            -- Rare Address Token View
+            SELECT s1.internal_id, s1.entity_id, t.internal_id, t.entity_id, 'rare_address_token'
+            FROM (
+                SELECT internal_id, entity_id, unnest(string_split(address_tokens, ' ')) AS token
+                FROM s1_chunk WHERE address_tokens != ''
+            ) s1 JOIN idx_rare_addr t ON s1.token = t.token AND s1.internal_id != t.internal_id
 
-            if "translit_name" in views and profile.translit_name:
-                translit_matches = conn.execute(
-                    "SELECT internal_id, entity_id FROM idx_translit WHERE translit_name = ?",
-                    [profile.translit_name]
-                ).fetchall()
-                for target_int_id, target_ent_id in translit_matches:
-                    if target_int_id != profile.internal_id:
-                        key = (target_int_id, target_ent_id)
-                        candidates_map.setdefault(key, []).append("translit_name")
+            UNION ALL
 
-            # Check candidate overflow
-            overflow = 0
-            if len(candidates_map) > config.max_candidates_per_entity:
-                overflow = 1
-                logger.debug(f"Candidate explosion for {profile.entity_id}: {len(candidates_map)} candidates. Triggering fallback.")
-                # Fallback: keep top candidates that match core_name or rare address tokens
-                filtered_map = {}
-                for (target_int_id, target_ent_id), ev_views in candidates_map.items():
-                    if "core_name" in ev_views or "rare_address_token" in ev_views or "exact_name" in ev_views:
-                        filtered_map[(target_int_id, target_ent_id)] = ev_views
+            -- Numeric Token View
+            SELECT s1.internal_id, s1.entity_id, t.internal_id, t.entity_id, 'numeric_token'
+            FROM (
+                SELECT internal_id, entity_id, unnest(string_split(numeric_tokens, ' ')) AS numeric_token
+                FROM s1_chunk WHERE numeric_tokens != ''
+            ) s1 JOIN idx_numeric t ON s1.numeric_token = t.numeric_token AND s1.internal_id != t.internal_id
 
-                # If still empty or over limit, cap at max_candidates_per_entity
-                if filtered_map:
-                    candidates_map = dict(list(filtered_map.items())[:config.max_candidates_per_entity])
-                else:
-                    candidates_map = dict(list(candidates_map.items())[:config.max_candidates_per_entity])
+            UNION ALL
 
-            # Flatten to candidate records
-            for (target_int_id, target_ent_id), ev_views in candidates_map.items():
-                all_candidate_rows.append({
-                    "s1_internal_id": profile.internal_id,
-                    "s1_entity_id": profile.entity_id,
-                    "target_internal_id": target_int_id,
-                    "target_entity_id": target_ent_id,
-                    "blocking_views": ",".join(sorted(set(ev_views))),
-                    "num_blocking_views": len(set(ev_views)),
-                    "overflow": overflow,
-                })
+            -- Transliterated Name View
+            SELECT s1.internal_id, s1.entity_id, t.internal_id, t.entity_id, 'translit_name'
+            FROM s1_chunk s1 JOIN idx_translit t ON s1.translit_name = t.translit_name AND s1.internal_id != t.internal_id
+            WHERE s1.translit_name != ''
+        """)
 
-        df_cands = pd.DataFrame(all_candidate_rows)
-        if not df_cands.empty:
-            df_cands.to_parquet(out_parquet, index=False)
-        else:
-            # Empty candidate frame schema
-            pd.DataFrame(columns=[
-                "s1_internal_id", "s1_entity_id", "target_internal_id", "target_entity_id",
-                "blocking_views", "num_blocking_views", "overflow"
-            ]).to_parquet(out_parquet, index=False)
+        # Aggregate evidence views per pair and rank candidates to handle overflow
+        conn.execute(f"""
+            COPY (
+                WITH aggregated_cands AS (
+                    SELECT s1_internal_id, s1_entity_id, target_internal_id, target_entity_id,
+                           string_agg(DISTINCT blocking_view, ',') AS blocking_views,
+                           COUNT(DISTINCT blocking_view) AS num_blocking_views
+                    FROM raw_cands
+                    GROUP BY s1_internal_id, s1_entity_id, target_internal_id, target_entity_id
+                ),
+                ranked_cands AS (
+                    SELECT *,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY s1_internal_id
+                               ORDER BY num_blocking_views DESC, target_internal_id ASC
+                           ) AS rank_idx,
+                           COUNT(*) OVER (PARTITION BY s1_internal_id) AS total_entity_cands
+                    FROM aggregated_cands
+                )
+                SELECT s1_internal_id, s1_entity_id, target_internal_id, target_entity_id,
+                       blocking_views, num_blocking_views,
+                       CASE WHEN total_entity_cands > {config.max_candidates_per_entity} THEN 1 ELSE 0 END AS overflow
+                FROM ranked_cands
+                WHERE rank_idx <= {config.max_candidates_per_entity}
+            ) TO '{out_parquet}' (FORMAT PARQUET)
+        """)
 
-        manifest.mark_chunk_completed(stage_name, chunk_id, str(out_parquet), len(df_cands))
+        conn.execute("DROP TABLE raw_cands")
+        conn.execute("DROP VIEW s1_chunk")
+
+        cand_count = conn.execute(f"SELECT COUNT(*) FROM read_parquet('{out_parquet}')").fetchone()[0]
+        manifest.mark_chunk_completed(stage_name, chunk_id, str(out_parquet), cand_count)
         log_memory(f"Generated candidates chunk {chunk_id}")
 
     conn.close()

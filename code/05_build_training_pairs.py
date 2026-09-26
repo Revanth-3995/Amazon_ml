@@ -33,7 +33,6 @@ def build_training_pairs(config: Config, resume: bool = True) -> None:
         logger.error(f"Ground truth file {gt_file} not found. Cannot build training pairs.")
         return
 
-    # Load GT pairs into set for fast O(1) lookup
     df_gt = pd.read_csv(gt_file, sep="\t", dtype=str, keep_default_na=False)
     gt_pairs: Set[Tuple[str, str]] = set()
 
@@ -47,8 +46,7 @@ def build_training_pairs(config: Config, resume: bool = True) -> None:
 
     logger.info(f"Loaded {len(gt_pairs)} ground truth positive pairs.")
 
-    # Process candidates chunks
-    cand_files = sorted(list(config.candidates_dir.glob("candidates_*.parquet")))
+    cand_files = sorted(list(config.candidates_dir.glob("candidates_train_source1_*.parquet")))
     if not cand_files:
         logger.error(f"No candidate files found in {config.candidates_dir}. Run 04_generate_candidates.py first.")
         return
@@ -68,7 +66,6 @@ def build_training_pairs(config: Config, resume: bool = True) -> None:
             manifest.mark_chunk_completed(stage_name, chunk_id, str(out_parquet), 0)
             continue
 
-        # Label pairs
         labels = []
         for _, row in df_cands.iterrows():
             s1_id = row["s1_entity_id"]

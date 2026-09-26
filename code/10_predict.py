@@ -1,10 +1,11 @@
 """
 Inference & Entity Ranking Module.
-Predicts match probabilities on test candidates, applies decision thresholds,
-allows zero / one-to-many match set decisions, and outputs raw predictions.
+Predicts match probabilities on test candidate chunks incrementally, applies decision thresholds,
+allows zero / one-to-many match set decisions, and streams prediction outputs safely.
 """
 
 import argparse
+import gc
 import json
 import logging
 from pathlib import Path
@@ -40,7 +41,6 @@ def run_prediction(config: Config, threshold: float = None) -> None:
 
     model = joblib.load(model_path)
 
-    # Load threshold from validation report if not explicitly provided
     if threshold is None:
         val_json = config.evaluation_dir / "model_validation.json"
         if val_json.exists():
@@ -57,7 +57,8 @@ def run_prediction(config: Config, threshold: float = None) -> None:
         logger.warning(f"No test feature files found in {config.features_dir}. Run 06_build_features.py --is-test first.")
         return
 
-    all_preds = []
+    matched_pairs_list = []
+    raw_pred_files = []
 
     for feat_file in test_feat_files:
         df_feat = pd.read_parquet(feat_file)
@@ -69,24 +70,36 @@ def run_prediction(config: Config, threshold: float = None) -> None:
         df_feat["match_score"] = probs
         df_feat["is_match"] = (probs >= threshold).astype(int)
 
-        all_preds.append(df_feat[["s1_entity_id", "target_entity_id", "match_score", "is_match"]])
+        out_chunk_parquet = config.predictions_dir / f"pred_{feat_file.name}"
+        df_feat[["s1_entity_id", "target_entity_id", "match_score", "is_match"]].to_parquet(out_chunk_parquet, index=False)
+        raw_pred_files.append(out_chunk_parquet)
 
-    if all_preds:
-        df_all_preds = pd.concat(all_preds, ignore_index=True)
-    else:
-        df_all_preds = pd.DataFrame(columns=["s1_entity_id", "target_entity_id", "match_score", "is_match"])
+        # Collect positive matches for entity aggregation
+        df_matches = df_feat[df_feat["is_match"] == 1][["s1_entity_id", "target_entity_id"]]
+        if not df_matches.empty:
+            matched_pairs_list.append(df_matches)
+
+        del df_feat
+        gc.collect()
 
     out_parquet = config.predictions_dir / "raw_predictions.parquet"
     out_csv = config.predictions_dir / "entity_matches.csv"
 
-    df_all_preds.to_parquet(out_parquet, index=False)
+    # Merge raw predictions into single Parquet file if non-empty
+    if raw_pred_files:
+        df_all_raw = pd.concat([pd.read_parquet(f) for f in raw_pred_files], ignore_index=True)
+        df_all_raw.to_parquet(out_parquet, index=False)
+    else:
+        pd.DataFrame(columns=["s1_entity_id", "target_entity_id", "match_score", "is_match"]).to_parquet(out_parquet, index=False)
 
-    # Group by S1 entity ID to construct space-separated match string (supporting zero or multi matches)
-    df_matches = df_all_preds[df_all_preds["is_match"] == 1]
-    grouped = df_matches.groupby("s1_entity_id")["target_entity_id"].apply(lambda ids: " ".join(ids)).reset_index()
-    grouped.rename(columns={"s1_entity_id": "source1_entity_id", "target_entity_id": "matched_entity_ids"}, inplace=True)
+    if matched_pairs_list:
+        df_all_matches = pd.concat(matched_pairs_list, ignore_index=True)
+        grouped = df_all_matches.groupby("s1_entity_id")["target_entity_id"].apply(lambda ids: " ".join(sorted(set(ids)))).reset_index()
+        grouped.rename(columns={"s1_entity_id": "source1_entity_id", "target_entity_id": "matched_entity_ids"}, inplace=True)
+        grouped.to_csv(out_csv, index=False)
+    else:
+        pd.DataFrame(columns=["source1_entity_id", "matched_entity_ids"]).to_csv(out_csv, index=False)
 
-    grouped.to_csv(out_csv, index=False)
     logger.info(f"Saved prediction outputs: {out_parquet} and {out_csv}")
 
     log_memory("Prediction Complete")
